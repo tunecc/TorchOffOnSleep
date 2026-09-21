@@ -1,0 +1,76 @@
+# Comet 工作流域
+.comet/
+!.comet/config.yaml
+
+# 本地流程与 AI 工具文件：保留在磁盘上，不纳入版本控制、不推送到远端
+.claude/
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+skills-lock.json
+
+# 需求 / 设计 / 逆向笔记 / 验收记录等流程文档：同上，仅本地保留
+docs/
+RELEASE-NOTES.md
+
+# comet init 生成的各平台 skill 目录（本项目只用 Claude Code）
+.agents/
+.amazonq/
+.augment/
+.bob/
+.cline/
+.clinerules/
+.codebuddy/
+.codex/
+.continue/
+.cospec/
+.crush/
+.cursor/
+.devin/
+.dsh/
+.factory/
+.forge/
+.gemini/
+.github/
+.grok/
+.iflow/
+.junie/
+.kilocode/
+.kimi-code/
+.kiro/
+.lingma/
+.mimocode/
+.omp/
+.opencode/
+.pi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.trae-cn/
+.windsurf/
+.workbuddy/
+.zcode/
+
+# Theos 构建产物
+.theos/
+packages/
+obj/
+*.deb
+
+# 构建产物目录：deb 通过 GitHub Release 分发，不纳入版本控制
+out/
+
+# subagent-driven-development 工作区（账本 progress.md、各 task 的 brief/report）。
+# 这是 skill 的本地 scratch，其中的 sdd/.gitignore 自带 `*` 已经挡住了内容，
+# 但那是生成物、随时可能被重建；这里在工程根显式再压一层，双保险。
+.superpowers/
+
+# 系统元数据
+.DS_Store
+**/.DS_Store
+._*
+__MACOSX
+
+# 本地 Claude 设置
+.claude/settings.local.json

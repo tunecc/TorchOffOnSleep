@@ -1,0 +1,8 @@
+Package: com.tune.torchoffonsleep
+Name: TorchOffOnSleep
+Version: 1.0.0
+Depends: mobilesubstrate
+Section: Tweaks
+Maintainer: Tune <176898395+tunecc@users.noreply.github.com>
+Author: Tune <176898395+tunecc@users.noreply.github.com>
+Description: Turn the flashlight off with a single side-button press while the screen is off.

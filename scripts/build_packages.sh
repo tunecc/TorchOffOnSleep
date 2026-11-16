@@ -16,6 +16,8 @@
 #   8. 宿主元数据净化 clean_host_metadata（.DS_Store / ._* / __MACOSX）
 #   9. 符号门禁 scripts/verify_symbols.sh（DSC_PATH 未提供则跳过，不失败）
 #  10. 末尾打印两条线的验收命令提示
+#  11. 正式构建显式关闭文件日志（TORCH_OFF_ENABLE_FILELOG=0，见下方
+#      FORMAL_CFLAGS）：正式包不得写持久化日志，符合"不写持久化状态"规格。
 #
 # 可用环境变量：
 #   THEOS            theos 根目录，缺省 /opt/theos
@@ -70,6 +72,16 @@ ENABLE_ROOTFUL="${ENABLE_ROOTFUL:-0}"
 LOCK_WAIT_SECONDS="${LOCK_WAIT_SECONDS:-120}"
 LOCK_POLL_SECONDS=2
 LOCK_STALE_RETRIES=3
+
+# 正式构建的 CFLAGS。Theos 的 ALL_PFLAGS 会纳入
+# $(call __schema_var_all,$(THEOS_CURRENT_INSTANCE)_,CFLAGS)，即命令行的
+# TorchOffOnSleep_CFLAGS；该变量会**整体覆盖** Makefile 里的同名赋值，
+# 因此必须把 -fobjc-arc 一并带上，否则 ARC 关闭会编译失败。
+# TORCH_OFF_ENABLE_FILELOG=0 让 Tweak.xm 的文件日志通道在编译期变成空操作：
+# 正式包不写任何 .log 文件，符合"不写持久化状态 / 零日志噪音"规格。
+# 调试时若需文件日志，可临时改这里为 0 之外的方案，或直接手动 make 并显式
+# 传 TorchOffOnSleep_CFLAGS="-fobjc-arc -DTORCH_OFF_ENABLE_FILELOG=1"。
+FORMAL_CFLAGS="-fobjc-arc -DTORCH_OFF_ENABLE_FILELOG=0"
 
 # 由 trap 清理的全局状态
 LOCK_HELD=0
@@ -385,7 +397,7 @@ build_roothide_line() {
     log "=== 线 1/2：roothide（scheme 显式传 roothide，ARCHS=arm64e）==="
     prebuild_clean "$PKG_DIR_ROOTHIDE"
     run_make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide \
-        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTHIDE"
+        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTHIDE" "TorchOffOnSleep_CFLAGS=$FORMAL_CFLAGS"
     finalize_line "$PKG_DIR_ROOTHIDE" \
         "${PKG_ID}_${VERSION}_${ROOTHIDE_DEB_ARCH}.deb" \
         "$ROOTHIDE_DEB_ARCH" "$ROOTHIDE_SHORT_ARCH" "roothide"
@@ -395,7 +407,7 @@ build_rootless_line() {
     log "=== 线 2/2：rootless（scheme 显式传 rootless，ARCHS=arm64 arm64e）==="
     prebuild_clean "$PKG_DIR_ROOTLESS"
     run_make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless \
-        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTLESS"
+        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTLESS" "TorchOffOnSleep_CFLAGS=$FORMAL_CFLAGS"
     finalize_line "$PKG_DIR_ROOTLESS" \
         "${PKG_ID}_${VERSION}_${ROOTLESS_DEB_ARCH}.deb" \
         "$ROOTLESS_DEB_ARCH" "$ROOTLESS_SHORT_ARCH" "rootless"
@@ -405,7 +417,7 @@ build_rootful_line() {
     log "=== 附加线：rootful（显式空 scheme，仅 ENABLE_ROOTFUL=1 时执行）==="
     prebuild_clean "$PKG_DIR_ROOTFUL"
     run_make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME= \
-        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTFUL"
+        "THEOS_PACKAGE_DIR=$PKG_DIR_ROOTFUL" "TorchOffOnSleep_CFLAGS=$FORMAL_CFLAGS"
     finalize_line "$PKG_DIR_ROOTFUL" \
         "${PKG_ID}_${VERSION}_${ROOTFUL_DEB_ARCH}.deb" \
         "$ROOTFUL_DEB_ARCH" "$ROOTFUL_SHORT_ARCH" "rootful"

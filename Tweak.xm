@@ -46,7 +46,13 @@ static NSString *const kTorchOffReason = @"TorchOffOnSleep";
    现象与现场完全一致。因此需要一条**不依赖 os_log / Console** 的硬通道来定位。
 
    路径取 dylib 自身所在目录（dladdr 自省），roothide 与 rootless 两种环境都
-   无需假设 jbroot；目录不可写时退到 /tmp。os_log 通道保留，两路都写。 */
+   无需假设 jbroot；目录不可写时退到 /tmp。os_log 通道保留，两路都写。
+
+   【正式构建】整段（路径全局变量、路径初始化、写日志函数）都在
+   #if TORCH_OFF_ENABLE_FILELOG 内：正式包该宏为 0，既不会写任何 .log，也
+   不会把日志路径字符串编进二进制，满足"不写持久化状态 / 零日志噪音"规格。
+   调试时才把宏置 1 打开这条通道。 */
+#if TORCH_OFF_ENABLE_FILELOG
 static char g_toolLogPath[1152];
 
 static void TOOLInitLogPath(void)
@@ -66,7 +72,6 @@ static void TOOLInitLogPath(void)
     snprintf(g_toolLogPath, sizeof(g_toolLogPath), "/tmp/TorchOffOnSleep.log");
 }
 
-#if TORCH_OFF_ENABLE_FILELOG
 static void TOOLFileLog(const char *fmt, ...)
 {
     if (!g_toolLogPath[0]) return;
@@ -87,8 +92,11 @@ static void TOOLFileLog(const char *fmt, ...)
             TOOLLog(fmt, ##__VA_ARGS__);        \
         } while (0)
 #else
-    #define TOOLFileLog(fmt, ...) do { } while (0)
-    #define TOOLBOTH(fmt, ...)  TOOLLog(fmt, ##__VA_ARGS__)
+    /* 正式构建（FILELOG=0）：路径初始化与写日志都是空操作，构造函数里的
+       TOOLInitLogPath() 调用随之编成空语句，不产生任何 .log 路径字符串。 */
+    #define TOOLInitLogPath()       do { } while (0)
+    #define TOOLFileLog(fmt, ...)   do { } while (0)
+    #define TOOLBOTH(fmt, ...)      TOOLLog(fmt, ##__VA_ARGS__)
 #endif
 
 // TorchOffOnSleep：段 ② 私有接口声明（只声明用到的选择子）。
@@ -134,8 +142,13 @@ static BOOL TOOLShouldIntercept(void)
 {
     Class cls = %c(SBUIFlashlightController);
     if (!cls)                                          return NO;
-    if (![cls respondsToSelector:@selector(deviceSupportsFlashlight)]) return NO;
-    if (![cls deviceSupportsFlashlight])               return NO;   // iPad / iPod touch
+    /* iOS 16（实测 16.1.2）上 +deviceSupportsFlashlight 已不存在
+       respondsToSelector 为 false；旧实现在此直接 return NO，导致所有 hook 层
+       都走 %orig，插件静默失效。正确做法：selector 不存在时跳过本检查；
+       selector 存在时才保留原有语义（NO ⇒ 非手电筒设备，如 iPad / iPod touch）。 */
+    if ([cls respondsToSelector:@selector(deviceSupportsFlashlight)]) {
+        if (![cls deviceSupportsFlashlight])           return NO;   // iPad / iPod touch
+    }
     if (![cls respondsToSelector:@selector(sharedInstance)])         return NO;
 
     SBUIFlashlightController *fc = [cls sharedInstance];

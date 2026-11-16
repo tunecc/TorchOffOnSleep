@@ -2,10 +2,10 @@
 
 一个 iOS 越狱 tweak：屏幕已熄灭且手电筒开启时，按一次侧键（锁屏键）**只关闭手电筒、屏幕保持熄灭**；再按一次才正常亮屏。其余所有场景与原生行为一致。
 
-- 注入目标：`com.apple.SpringBoard`（仅此一个进程）
+- 注入目标：`com.apple.springboard`（仅此一个进程）
 - 无设置界面、无运行时配置、不写持久化状态、不注册守护进程
 - 目标系统：iOS 17.x。依赖的私有符号在 iOS 17.1 (21B80, iPhone16,2) 的 dyld shared cache 中已逐一确认存在
-- **验收状态：未做真机运行时验证。** 已完成的验证只有构建、包结构、二进制 slice、固件符号契约（静态）与反编译复核；设备上的实际行为未验证，详见文末「已知限制」第 1 条
+- **验收状态：roothide 线已在 iPhone11,2 / iOS 16.1.2 真机验证通过。** 构建、包结构、二进制 slice、固件符号契约（静态）、反编译复核与目标核心场景均已验证；目标 iOS 17.x 仍待对应设备确认，详见文末「已知限制」第 1 条
 
 ## 功能
 
@@ -46,7 +46,7 @@
 
 **为什么不要装到同一个环境**：两条线的包 id 相同（`com.tune.torchoffonsleep`），同一个环境里装两条会互相覆盖；且两条线的安装根不同，装错线不会按预期加载。请按设备实际所用的越狱环境选一条。
 
-两条线目前都只做到静态验收（构建、包结构、slice、固件符号契约），均未做设备运行时验证；其中 rootless 线未验证 SpringBoard 在 rootless 环境下是否真的加载它（见「已知限制」第 5 条）。
+roothide 线已完成静态验收并在 iPhone11,2 / iOS 16.1.2 真机通过核心场景；rootless 线只完成静态验收（构建、包结构、slice、固件符号契约），未验证 rootless 环境下 SpringBoard 是否真的加载它（见「已知限制」第 5 条）。
 
 ## 安装
 
@@ -128,18 +128,21 @@ DSC_PATH=/path/to/dyld_shared_cache_arm64e bash scripts/verify_symbols.sh
 
 ### 编译期开关
 
-两个开关都用 `#ifndef` 包裹，可在 `make` 命令行用 `TorchOffOnSleep_CFLAGS` 覆盖，无需改源码：
+三个开关都用 `#ifndef` 包裹，可在 `make` 命令行用 `TorchOffOnSleep_CFLAGS` 覆盖，无需改源码：
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `TORCH_OFF_SUPPRESS_WAKE` | `1` | `1` = 方案 A（不调 `%orig`，屏幕保持熄灭）；`0` = 亮屏并关灯。影响主 hook 与降级 2 |
 | `TORCH_OFF_ENABLE_LOG` | `0` | `0` = 零日志；`1` = 用 `os_log` 打印拦截命中、关灯调用与降级层号（排障用） |
+| `TORCH_OFF_ENABLE_FILELOG` | `1`（源码默认）／`0`（`scripts/build_packages.sh` 正式构建强制） | `0` = 关闭文件日志通道：不写任何 `.log`，二进制内也不含日志路径字符串；`1` = 调试时把日志写到 dylib 同目录 / `/tmp`，供 SSH 排障。正式包必须为 `0`，符合「不写持久化状态」规格 |
 
 注意：make 命令行的 `TorchOffOnSleep_CFLAGS` 会整体覆盖 Makefile 里的取值，重新指定时必须把 `-fobjc-arc` 一起带上。示例（构建「亮屏并关灯」语义的 rootless 包）：
 
 ```bash
 make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless TorchOffOnSleep_CFLAGS="-fobjc-arc -DTORCH_OFF_SUPPRESS_WAKE=0"
 ```
+
+`scripts/build_packages.sh` 是唯一认可的正式打包入口，它在每条构建线上都显式传入 `-DTORCH_OFF_ENABLE_FILELOG=0`，因此正式包默认不写文件日志。调试用途可临时手动 `make` 并显式传 `-DTORCH_OFF_ENABLE_FILELOG=1` 打开这条通道。
 
 ### 构建后自检
 
@@ -155,7 +158,7 @@ find /tmp/torchoff-rootless \( -name .DS_Store -o -name '._*' -o -name __MACOSX 
 
 ## 已知限制
 
-1. **无真机运行时验证。** 构建、包结构、二进制 slice、固件符号契约（iOS 17.1 (21B80, iPhone16,2) 的 dyld shared cache，20/20 命中）与反编译复核都做了，但设备上的实际行为未验证。本 README 不宣称功能已验证通过。
+1. **目标 iOS 17.x 无真机运行时验证。** 构建、包结构、二进制 slice、固件符号契约（iOS 17.1 (21B80, iPhone16,2) 的 dyld shared cache，20/20 命中）与反编译复核都做了；roothide 包已在 iPhone11,2 / iOS 16.1.2 真机验证通过：开启手电筒后熄屏按一次侧键会关灯且保持熄屏，再按一次亮屏，手电筒关闭时侧键原生亮屏。但由于目标版本是 iOS 17.x，当前不宣称 iOS 17.x 已实机验证。
 2. **淡出到锁屏的约 0.3 s 窗口内连按两次**：原生会逆转淡出、让屏幕回来；本插件会改为关灯并保持淡出。v1 不处理这个差异。
 3. **降级 3 无法抑制亮屏**：当 `_performWake` 与 `consumeInitialPressDown` 都不可用时，最后会降级到 hook `-[SBLockHardwareButtonActions performSinglePressAction]`；该点位于松手阶段、亮屏早已发生，语义退化为「亮屏 + 关灯」，`TORCH_OFF_SUPPRESS_WAKE` 在这一层无效。该层带一个屏幕守卫：借 `+[SBBacklightController sharedInstanceIfExists]` 取实例并读 `screenIsDim`，只在屏幕**未完全点亮**（熄灭或变暗）时才关灯。守卫拿不到 `SBBacklightController` 实例、或 `screenIsDim` 不可用时选择**不干预**（这一次按压少关一次灯可以接受，在屏幕点亮时关手电筒才是要避免的）。
 4. **AOD 显示态不关灯**：常亮显示处于显示态时，系统本身不执行亮屏动作，插件继承该语义，同样不关灯（这一点已写入行为契约）。
@@ -173,7 +176,7 @@ find /tmp/torchoff-rootless \( -name .DS_Store -o -name '._*' -o -name __MACOSX 
 
 同时对其子类 `SBDoubleClickSleepWakeHardwareButtonInteraction` 也装一份：反编译确认子类覆盖了 `_performWake`，而 Substrate 的 hook 替换的是具体类的 IMP——只 hook 父类时，设备实例化子类会让父类被 hook 的 IMP 被绕过，插件静默失效。
 
-命中判据只有一个：`SBUIFlashlightController` 存在、`deviceSupportsFlashlight` 为真、`level > 0`。未命中时直接 `%orig`，走原生逻辑。
+命中判据是：`SBUIFlashlightController` 存在、`sharedInstance` 存在、`level > 0`；若当前系统存在 `+deviceSupportsFlashlight`，还会要求它为真（iPad / iPod touch 零干预）。iOS 16.1.2 实测该 selector 不存在，此时会跳过该检查；未命中时直接 `%orig`，走原生逻辑。
 
 ### 为什么「屏幕已熄灭」这个条件由系统前置判定免费继承
 
@@ -183,27 +186,18 @@ find /tmp/torchoff-rootless \( -name .DS_Store -o -name '._*' -o -name __MACOSX 
 
 - **补 `setInhibitNextSinglePressUp:YES`**：原生 `_performWake` 在亮屏成功后会把该标志置 YES，使松手阶段的 `consumeSinglePressUp` 变成空操作。方案 A 不调 `%orig`，这个赋值就不会发生，松手时会误走 `_performSleep()`（表现为多一声锁屏音加一次锁屏动画），所以显式复用它。
 - **关灯走系统通道**：`-[SBUIFlashlightController turnFlashlightOffForReason:]`，保证各官方入口的手电筒状态一致。
-- **注入过滤**：`TorchOffOnSleep.plist` 只注入 `com.apple.SpringBoard`，不碰其它进程。
-- **三层降级装填**：`_performWake` → `consumeInitialPressDown` → `performSinglePressAction`，按符号可用性择一安装；三层全无则什么都不装，侧键行为与原生一致。装填在主队列首轮完成（早于任何 HID 事件被处理），降级判断不在按压路径上临时探测。
-- **无运行时配置**：没有设置界面、没有配置文件、没有守护进程，只有两个编译期开关。
-
-### 文档索引
-
-| 文档 | 内容 |
-|---|---|
-| `docs/openspec/changes/torch-off-on-lock-press/specs/torch-off-on-lock-press/spec.md` | 行为契约（delta spec） |
-| `docs/superpowers/specs/2026-09-21-torch-off-on-sleep-design.md` | 技术设计（含 §8 已知限制） |
-| `docs/RE-notebook.md` | 逆向笔记（侧键控制流、xref 证据、符号地址、hook 点取舍） |
+- **注入过滤**：`TorchOffOnSleep.plist` 只注入 `com.apple.springboard`，不碰其它进程。
+- **三层降级装填**：`_performWake` → `consumeInitialPressDown` → `performSinglePressAction`，按符号可用性择一安装；三层全无则什么都不装，侧键行为与原生一致。装填在 tweak 的构造函数（`%ctor`）里**同步**完成：注入进已运行的 SpringBoard 时目标类必然已注册，当场即可装填，不依赖主队列；只有在构造期一个类都没响应时，才回退到主队列再试一次。降级判断不在按压路径上临时探测。
+- **无运行时配置**：没有设置界面、没有配置文件、没有守护进程，只有三个编译期开关。
 
 ### 仓库结构
 
 ```
 Makefile                          theos 构建定义（ARCHS 按 scheme 分流）
 control                           deb 元数据（Package: com.tune.torchoffonsleep）
-TorchOffOnSleep.plist             注入过滤（仅 com.apple.SpringBoard）
+TorchOffOnSleep.plist             注入过滤（仅 com.apple.springboard）
 Tweak.xm                          全部插件逻辑（单文件）
 scripts/build_packages.sh         统一打包入口（两条产物线 + 符号门禁）
 scripts/verify_symbols.sh         固件符号契约门禁（20 个符号）
 out/                              构建产物（两个 deb）
-docs/                             行为契约、技术设计、逆向笔记
 ```

@@ -55,6 +55,15 @@
 
 两个包的包 id 相同（`com.tune.torchoffonsleep`），**不要装到同一个环境**：同一环境装两个会互相覆盖，且安装根不同，装错环境不会按预期加载。请按设备实际的越狱环境二选一。
 
+## 下载
+
+安装包不进版本库，统一发布在 [Releases](https://github.com/tunecc/TorchOffOnSleep/releases) 页面：
+
+- `TorchOffOnSleep_1.0.0_roothide_arm64e.deb` —— roothide / bootstrap 环境
+- `TorchOffOnSleep_1.0.0_rootless_arm64.deb` —— rootless 环境
+
+两个文件都在对应版本的 Assets 下，SHA256 校验值写在 Release 说明里。
+
 ## 安装
 
 把对应 deb 传到设备（scp、文件管理器等方式均可），在设备上以 root 执行。
@@ -205,5 +214,6 @@ TorchOffOnSleep.plist             注入过滤（仅 com.apple.springboard）
 Tweak.xm                          全部插件逻辑（单文件）
 scripts/build_packages.sh         统一打包入口（两个包 + 符号门禁）
 scripts/verify_symbols.sh         固件符号契约门禁（20 个符号）
-out/                              构建产物（两个 deb）
 ```
+
+`out/` 是构建产物目录，不入库；安装包通过 Releases 分发。

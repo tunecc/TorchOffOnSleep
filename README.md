@@ -155,9 +155,9 @@ find /tmp/torchoff-rootless \( -name .DS_Store -o -name '._*' -o -name __MACOSX 
 
 ## 已知限制
 
-1. **无真机运行时验证。** 构建、包结构、二进制 slice、固件符号契约（iOS 17.1 (21B80, iPhone16,2) 的 dyld shared cache，17/17 命中）与反编译复核都做了，但设备上的实际行为未验证。本 README 不宣称功能已验证通过。
+1. **无真机运行时验证。** 构建、包结构、二进制 slice、固件符号契约（iOS 17.1 (21B80, iPhone16,2) 的 dyld shared cache，20/20 命中）与反编译复核都做了，但设备上的实际行为未验证。本 README 不宣称功能已验证通过。
 2. **淡出到锁屏的约 0.3 s 窗口内连按两次**：原生会逆转淡出、让屏幕回来；本插件会改为关灯并保持淡出。v1 不处理这个差异。
-3. **降级 3 无法抑制亮屏**：当 `_performWake` 与 `consumeInitialPressDown` 都不可用时，最后会降级到 hook `-[SBLockHardwareButtonActions performSinglePressAction]`；该点位于松手阶段、亮屏早已发生，语义退化为「亮屏 + 关灯」，`TORCH_OFF_SUPPRESS_WAKE` 在这一层无效。
+3. **降级 3 无法抑制亮屏**：当 `_performWake` 与 `consumeInitialPressDown` 都不可用时，最后会降级到 hook `-[SBLockHardwareButtonActions performSinglePressAction]`；该点位于松手阶段、亮屏早已发生，语义退化为「亮屏 + 关灯」，`TORCH_OFF_SUPPRESS_WAKE` 在这一层无效。该层带一个屏幕守卫：借 `+[SBBacklightController sharedInstanceIfExists]` 取实例并读 `screenIsDim`，只在屏幕**未完全点亮**（熄灭或变暗）时才关灯。守卫拿不到 `SBBacklightController` 实例、或 `screenIsDim` 不可用时选择**不干预**（这一次按压少关一次灯可以接受，在屏幕点亮时关手电筒才是要避免的）。
 4. **AOD 显示态不关灯**：常亮显示处于显示态时，系统本身不执行亮屏动作，插件继承该语义，同样不关灯（这一点已写入行为契约）。
 5. **rootless 线只验到包结构与 slice**：未验证 rootless 环境下 SpringBoard 是否真的加载它。
 6. **17.0–17.4 符号稳定性未在其它小版本上验证**：三层降级加 `respondsToSelector:` 判空是对付符号缺失的唯一防线。
@@ -203,7 +203,7 @@ control                           deb 元数据（Package: com.tune.torchoffonsl
 TorchOffOnSleep.plist             注入过滤（仅 com.apple.SpringBoard）
 Tweak.xm                          全部插件逻辑（单文件）
 scripts/build_packages.sh         统一打包入口（两条产物线 + 符号门禁）
-scripts/verify_symbols.sh         固件符号契约门禁（17 个符号）
+scripts/verify_symbols.sh         固件符号契约门禁（20 个符号）
 out/                              构建产物（两个 deb）
 docs/                             行为契约、技术设计、逆向笔记
 ```

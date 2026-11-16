@@ -4,16 +4,29 @@
 // "cannot find interface declaration for 'NSObject'"，故在文件开头导入。
 #import <UIKit/UIKit.h>
 
-/* 两个编译期开关：默认值见 Design Doc §5。均可用 make 命令行的
-   TorchOffOnSleep_CFLAGS 覆盖，因此必须用 #ifndef 包裹，不能把值写死。
-   SUPPRESS_WAKE 默认 1（方案 A：不调 %orig，屏幕保持熄灭）；ENABLE_LOG
-   默认 0（零日志，不给 SpringBoard 日常使用增加日志噪音）。 */
+#include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <dispatch/dispatch.h>
+
+/* 三个编译期开关：均可用 make 命令行的 TorchOffOnSleep_CFLAGS 覆盖，
+   因此必须用 #ifndef 包裹，不能把值写死。
+   - SUPPRESS_WAKE 默认 1（方案 A：不调 %orig，屏幕保持熄灭）
+   - ENABLE_LOG 默认 0（零 os_log，不给 SpringBoard 日常使用增加日志噪音）
+   - ENABLE_FILELOG 默认 1（文件日志通道，真机排障用；正式发布版必须置 0，
+     见下方说明——它不依赖 os_log/Console，SSH 里 find + cat 即可读取） */
 #ifndef TORCH_OFF_SUPPRESS_WAKE
     #define TORCH_OFF_SUPPRESS_WAKE 1
 #endif
 
 #ifndef TORCH_OFF_ENABLE_LOG
     #define TORCH_OFF_ENABLE_LOG 0
+#endif
+
+#ifndef TORCH_OFF_ENABLE_FILELOG
+    #define TORCH_OFF_ENABLE_FILELOG 1
 #endif
 
 /* 关灯原因字符串：内容自定义，SpringBoardUI 只把它当去重/日志用的 tag。 */
@@ -25,6 +38,57 @@ static NSString *const kTorchOffReason = @"TorchOffOnSleep";
     #define TOOLLog(fmt, ...) os_log(OS_LOG_DEFAULT, "[TorchOffOnSleep] " fmt, ##__VA_ARGS__)
 #else
     #define TOOLLog(fmt, ...) do { } while (0)
+#endif
+
+/* 文件日志通道。引入原因：真机测试出现"零日志、零效果"，而原实现把整个初始化
+   押在 %ctor 里一次 dispatch_async 上（反编译确认构造函数除了 dispatch_async
+   什么都不做）。一旦那次投递没成功，就没有 %init、没有日志、没有任何效果，
+   现象与现场完全一致。因此需要一条**不依赖 os_log / Console** 的硬通道来定位。
+
+   路径取 dylib 自身所在目录（dladdr 自省），roothide 与 rootless 两种环境都
+   无需假设 jbroot；目录不可写时退到 /tmp。os_log 通道保留，两路都写。 */
+static char g_toolLogPath[1152];
+
+static void TOOLInitLogPath(void)
+{
+    g_toolLogPath[0] = '\0';
+
+    Dl_info info;
+    if (dladdr((void *)TOOLInitLogPath, &info) && info.dli_fname && info.dli_fname[0]) {
+        snprintf(g_toolLogPath, sizeof(g_toolLogPath), "%s.log", info.dli_fname);
+        /* 立刻试写一次：dylib 目录不一定可写（属主/selinux），不可写就退到 /tmp */
+        FILE *probe = fopen(g_toolLogPath, "a");
+        if (probe) {
+            fclose(probe);
+            return;
+        }
+    }
+    snprintf(g_toolLogPath, sizeof(g_toolLogPath), "/tmp/TorchOffOnSleep.log");
+}
+
+#if TORCH_OFF_ENABLE_FILELOG
+static void TOOLFileLog(const char *fmt, ...)
+{
+    if (!g_toolLogPath[0]) return;
+
+    FILE *f = fopen(g_toolLogPath, "a");
+    if (!f) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+    #define TOOLBOTH(fmt, ...)                  \
+        do {                                    \
+            TOOLFileLog(fmt, ##__VA_ARGS__);    \
+            TOOLLog(fmt, ##__VA_ARGS__);        \
+        } while (0)
+#else
+    #define TOOLFileLog(fmt, ...) do { } while (0)
+    #define TOOLBOTH(fmt, ...)  TOOLLog(fmt, ##__VA_ARGS__)
 #endif
 
 // TorchOffOnSleep：段 ② 私有接口声明（只声明用到的选择子）。
@@ -40,7 +104,8 @@ static NSString *const kTorchOffReason = @"TorchOffOnSleep";
 @end
 
 @interface SBBacklightController : NSObject
-- (BOOL)screenIsDim;          // 仅降级 2 使用
++ (instancetype)sharedInstanceIfExists;  // 降级 3 专用：只取已有实例，不创建
+- (BOOL)screenIsDim;          // 降级 2 与降级 3 的屏幕守卫
 @end
 
 @interface SBSleepWakeHardwareButtonInteraction : NSObject
@@ -74,18 +139,107 @@ static BOOL TOOLShouldIntercept(void)
     if (![cls respondsToSelector:@selector(sharedInstance)])         return NO;
 
     SBUIFlashlightController *fc = [cls sharedInstance];
-    if (!fc)                                           return NO;
-    if (![fc respondsToSelector:@selector(level)])     return NO;
+    if (!fc)      { TOOLBOTH("predicate: no sharedInstance");      return NO; }
+    if (![fc respondsToSelector:@selector(level)]) {
+        TOOLBOTH("predicate: no level selector");                 return NO;
+    }
 
-    return [fc level] > 0;
+    NSUInteger lv = [fc level];
+    TOOLBOTH("predicate: level=%lu", (unsigned long)lv);
+    return lv > 0;
+}
+
+// TorchOffOnSleep：段 ③.5 关灯入口与屏幕状态取用（三个 hook 层共用的基础设施）。
+//
+// 两块内容都从各层方法体里抽出来放到这里，理由是三处降级必须共用同一份实现：
+//   - TOOLTurnOffTorch()：全项目唯一的关灯调用点，带 @try/@catch 异常守卫（I3）
+//     与关灯日志（I4）。"先关灯、成功才置 inhibit"的顺序也只有这一份。
+//   - 屏幕状态取用：降级 2 的 self 是 interaction 实例，有 backlightController
+//     方法；降级 3 的 self 是 SBLockHardwareButtonActions，没有该方法，只能改从
+//     类方法取实例。两条入口都遵守同一条铁律：拿不到信息就不做抑制决定。
+
+/* 唯一的关灯调用点。返回 YES = 关灯调用正常返回；NO = 控制器拿不到 / 选择子缺失 /
+   调用抛异常。调用方拿到 NO 时必须走完整原生路径：不置
+   setInhibitNextSinglePressUp:、不抑制亮屏，本次按压与未装插件时完全一致。 */
+static BOOL TOOLTurnOffTorch(void)
+{
+    SBUIFlashlightController *fc = [%c(SBUIFlashlightController) sharedInstance];
+    if (!fc)                                                        return NO;
+    if (![fc respondsToSelector:@selector(turnFlashlightOffForReason:)]) return NO;
+
+#if TORCH_OFF_ENABLE_LOG
+    /* I4：把关灯前的 level 一起打出来，日志才能回答"灯当时到底亮没亮"。
+       必须用 #if 包住：TORCH_OFF_ENABLE_LOG=0 时 TOOLLog 展开为空语句，这个
+       变量会被判未使用，而 theos 带 -Werror，会直接编译失败。 */
+    NSUInteger levelBefore = [fc respondsToSelector:@selector(level)] ? [fc level] : 0;
+#endif
+
+    /* I3：turnFlashlightOffForReason: 内部是 setLevel:0 → _setFlashlightLevel:
+       → AVFoundation，任何一层抛 ObjC 异常都会穿过我们的 hook 直达 SpringBoard
+       的 HID 路径，最坏结果是 SpringBoard 崩溃、设备不可用。delta spec 明确要求
+       "本次按压 MUST NOT 导致 SpringBoard 崩溃"，所以这里必须接住。 */
+    @try {
+        [fc turnFlashlightOffForReason:kTorchOffReason];
+#if TORCH_OFF_ENABLE_FILELOG
+        TOOLFileLog("torch off called (level before=%lu)",
+                    (unsigned long)([fc respondsToSelector:@selector(level)] ? [fc level] : 0));
+#endif
+    } @catch (NSException *e) {
+        TOOLLog("turnFlashlightOffForReason: 抛出异常：%{public}@", e.reason);
+        return NO;
+    }
+
+    /* I4：文档承诺的"关灯调用"日志，只有真正调成功才打。 */
+    TOOLLog("手电筒已关闭（调用前 level=%lu）", (unsigned long)levelBefore);
+    return YES;
+}
+
+/* 从类方法取 SBBacklightController 实例（降级 3 唯一可用的入口）。
+   用 sharedInstanceIfExists 而不是 sharedInstance：后者在实例不存在时会创建它，
+   而我们在松手阶段只是"问一句屏幕亮不亮"，没有理由产生创建背光控制器的副作用。
+   三级判空：类不存在 → 类不响应该选择子 → 实例为 nil。任一级失败返回 nil，
+   调用方按"拿不到屏幕状态 ⇒ 不干预"处理。 */
+static SBBacklightController *TOOLBacklightController(void)
+{
+    Class cls = %c(SBBacklightController);
+    if (!cls)                                                    return nil;
+    if (![cls respondsToSelector:@selector(sharedInstanceIfExists)]) return nil;
+    return [cls sharedInstanceIfExists];
+}
+
+/* 降级 2 的屏幕守卫（Design Doc §3.2，三级判空照抄）：从 interaction 实例取。
+   respondsToSelector(backlightController) → 非 nil → respondsToSelector(screenIsDim)。
+   任一级拿不到就返回 NO（= "不敢说屏幕没全亮"），让调用方走 %orig，
+   绝不在信息不足时做抑制决定。 */
+static BOOL TOOLScreenIsNotFullyOn(id interaction)
+{
+    if (![interaction respondsToSelector:@selector(backlightController)]) return NO;
+    id bl = [interaction backlightController];
+    if (!bl) return NO;
+    if (![bl respondsToSelector:@selector(screenIsDim)]) return NO;
+    return [bl screenIsDim];
+}
+
+/* 降级 3 的屏幕守卫（I2）：self 是 SBLockHardwareButtonActions，没有
+   backlightController 方法，所以必须走上面的类方法入口，不能复用基于 self 的
+   TOOLScreenIsNotFullyOn()——那样会恒返回 NO，把降级 3 变成纯透传。
+   拿不到实例或 screenIsDim 不可用都返回 NO，方向选"不干预"：这一个按压少关一次
+   灯可以接受，在屏幕还亮着时关灯则违反 delta spec 的
+   「MUST NOT 在屏幕点亮状态下关闭手电筒」。 */
+static BOOL TOOLScreenIsNotFullyOnViaBacklightController(void)
+{
+    SBBacklightController *bl = TOOLBacklightController();
+    if (!bl) return NO;
+    if (![bl respondsToSelector:@selector(screenIsDim)]) return NO;
+    return [bl screenIsDim];
 }
 
 // TorchOffOnSleep：段 ④ hooks —— 本任务只做主 group（第 1 层）的两个类。
 // 降级 2 / 降级 3 的 group 由后续任务追加，此处不写。
 //
 // 两个类各用一个独立 group，不用"同一 group 内连续两个 %hook"的紧凑写法——
-// 该写法依 Logos 版本而异，拆开无歧义。两个 group 的方法体逐字符相同（除 %hook
-// 的类名），靠调用同一个共享函数保证：改一处即改两处，不会漏。
+// 该写法依 Logos 版本而异，拆开无歧义。两个 group 的方法体一致（仅日志里标注了
+// 子类），实际逻辑靠调用同一个共享函数保证：改一处即改两处，不会漏。
 //
 // 覆盖两个类的原因（Design Doc §3.0）：Substrate 的 hook 替换的是具体类的 IMP。
 // SBDoubleClickSleepWakeHardwareButtonInteraction 覆盖了 _performWake，若只 hook
@@ -102,17 +256,18 @@ static BOOL TOOLShouldIntercept(void)
 // 不调 %orig，这个赋值就不会发生，松手时会走 _performSleep()——表现为多一声锁屏音
 // + 一次锁屏动画。复用它而不是自造标志位。
 
-/* 共享实现：抑制下一次松手 → 关手电筒 → 视 TORCH_OFF_SUPPRESS_WAKE 决定是否调原生。
-   判据判定放在 hook 里：未命中直接 %orig 返回，不进这里。
+/* 共享实现：关手电筒 → 成功才抑制下一次松手 → 视 TORCH_OFF_SUPPRESS_WAKE 决定是否
+   调原生。判据判定放在 hook 里：未命中直接 %orig 返回，不进这里。
+   顺序很关键（I3）：关灯必须先于置 inhibit。关灯失败时完整走原生路径，绝不留
+   "松手被抑制但灯没关"的半拦截状态。
    "是否调原生"做成 block 传进来：%orig 只能写在 %hook 块内、不能传参，所以每个
    group 各留一个极薄的转发方法，把真正的 %orig 调用留在 hook 块里。 */
 static void TOOLTurnOffTorchAndMaybeSuppress(id self, void (^callOrig)(void))
 {
+    if (!TOOLTurnOffTorch()) { callOrig(); return; }   // 关灯失败 ⇒ 完全走原生
+
     if ([self respondsToSelector:@selector(setInhibitNextSinglePressUp:)])
         [self setInhibitNextSinglePressUp:YES];
-
-    [[%c(SBUIFlashlightController) sharedInstance]
-        turnFlashlightOffForReason:kTorchOffReason];
 
 #if TORCH_OFF_SUPPRESS_WAKE
     return;      // 不调用 %orig ⇒ 屏幕保持熄灭
@@ -126,6 +281,7 @@ static void TOOLTurnOffTorchAndMaybeSuppress(id self, void (^callOrig)(void))
 - (void)_performWake
 {
     if (!TOOLShouldIntercept()) { %orig; return; }
+    TOOLLog("命中拦截判据：第 1 层主 hook _performWake");
     TOOLTurnOffTorchAndMaybeSuppress(self, ^{ %orig; });
 }
 %end
@@ -136,6 +292,7 @@ static void TOOLTurnOffTorchAndMaybeSuppress(id self, void (^callOrig)(void))
 - (void)_performWake
 {
     if (!TOOLShouldIntercept()) { %orig; return; }
+    TOOLLog("命中拦截判据：第 1 层主 hook _performWake（子类）");
     TOOLTurnOffTorchAndMaybeSuppress(self, ^{ %orig; });
 }
 %end
@@ -146,7 +303,8 @@ static void TOOLTurnOffTorchAndMaybeSuppress(id self, void (^callOrig)(void))
 // §3.0）：SBDoubleClickSleepWakeHardwareButtonInteraction 覆盖了
 // consumeInitialPressDown，只 hook 父类会在设备实例化子类时静默漏掉。
 //
-// 为什么这一层要多判一个 TOOLScreenIsNotFullyOn()：consumeInitialPressDown 位于
+// 为什么这一层要多判一个 TOOLScreenIsNotFullyOn()（定义见段 ③.5，与降级 3 的
+// 屏幕守卫放在一起）：consumeInitialPressDown 位于
 // _performWake 之前，系统自己的屏幕判定还没替我们做完——主 group 的「屏幕已熄灭」
 // 是由所处位置免费继承的（见段 ④ 注释 D2），降级 2 继承不到。不补这一判，就会在
 // 手电筒开着、屏幕其实还亮着时把按下消费掉，用户连点亮屏幕都做不到。
@@ -158,31 +316,22 @@ static void TOOLTurnOffTorchAndMaybeSuppress(id self, void (^callOrig)(void))
 // "抑制亮屏与否"；这里要返回 BOOL（是否消费本次按下），签名与返回值都不同，故另写
 // 一个，避免把两种返回值搅在一个函数里。
 
-/* 三级判空照抄 Design Doc §3.2：respondsToSelector(backlightController) → 非 nil →
-   respondsToSelector(screenIsDim)。任一级拿不到就返回 NO（= "不敢说屏幕没全亮"），
-   让调用方走 %orig，绝不在信息不足时做抑制决定。 */
-static BOOL TOOLScreenIsNotFullyOn(id interaction)
-{
-    if (![interaction respondsToSelector:@selector(backlightController)]) return NO;
-    id bl = [interaction backlightController];
-    if (!bl) return NO;
-    if (![bl respondsToSelector:@selector(screenIsDim)]) return NO;
-    return [bl screenIsDim];
-}
-
 /* 共享实现（Design Doc §3.2 的 TOOLConsumeInitialPressDownBody）：判据 + 屏幕未全亮
-   ⇒ 抑制下一次松手 → 关手电筒 → 视 TORCH_OFF_SUPPRESS_WAKE 决定是消费掉本次按下还是
-   放行。未命中直接 %orig。
+   ⇒ 关手电筒 → 成功才抑制下一次松手 → 视 TORCH_OFF_SUPPRESS_WAKE 决定是消费掉本次
+   按下还是放行。未命中直接 %orig。
+   顺序同样关键（I3）：先关灯，失败则原样返回原生结果——不置 inhibit、不消费按下，
+   本次按压与未装插件时一致。
    %orig 只能写在 %hook 块内，故沿用段 ④ 的 block 转发手法；这里的 block 返回 BOOL，
    好让"未命中"分支原样带回原生的返回值。 */
 static BOOL TOOLConsumeInitialPressDownBody(id self, BOOL (^callOrig)(void))
 {
     if (TOOLShouldIntercept() && TOOLScreenIsNotFullyOn(self)) {
+        TOOLLog("命中拦截判据且屏幕未全亮：第 2 层降级 consumeInitialPressDown");
+
+        if (!TOOLTurnOffTorch()) return callOrig();   // 关灯失败 ⇒ 完全走原生
+
         if ([self respondsToSelector:@selector(setInhibitNextSinglePressUp:)])
             [self setInhibitNextSinglePressUp:YES];
-
-        [[%c(SBUIFlashlightController) sharedInstance]
-            turnFlashlightOffForReason:kTorchOffReason];
 
 #if TORCH_OFF_SUPPRESS_WAKE
         return YES;   // 消费掉本次按下，不亮屏
@@ -216,20 +365,29 @@ static BOOL TOOLConsumeInitialPressDownBody(id self, BOOL (^callOrig)(void))
 %end
 
 // TorchOffOnSleep：段 ⑥ 降级 3 —— SBLockHardwareButtonActions
-// -performSinglePressAction（Design Doc §3.3，代码块逐字符照抄）。
+// -performSinglePressAction（Design Doc §3.3）。
 // 这是最后一层：hook 的是 actions 对象而不是 interaction，且位于松手阶段，而原生
 // 亮屏发生在按下瞬间，所以它只能做到"亮屏 + 关灯"，无法实现方案 A 的抑制亮屏，
 // TORCH_OFF_SUPPRESS_WAKE 在这一层无效。
 // 因此 %orig 无条件出现在判据之外、不被任何 #if 包裹：亮屏早已发生，拦不住也不必拦。
+//
+// 与 Design Doc §3.3 代码块的唯一差异（I2）：判据里多了一个屏幕守卫。
+// §3.3 只判手电筒不判屏幕，而 performSinglePressAction 在"屏幕点亮时按侧键息屏"
+// 这条路径上同样被调用，那一按会被插件关掉手电筒，违反 delta spec 的
+// 「MUST NOT 在屏幕点亮状态下关闭手电筒」。守卫只能从类方法取 SBBacklightController
+// （本层的 self 是 SBLockHardwareButtonActions，没有 backlightController 方法），
+// 取不到就不干预——降级路径宁可少覆盖一次，也不冒误关灯的风险。
 
 %group TorchOffSinglePress
 %hook SBLockHardwareButtonActions
 
 - (void)performSinglePressAction
 {
-    if (TOOLShouldIntercept()) {
-        [[%c(SBUIFlashlightController) sharedInstance]
-            turnFlashlightOffForReason:kTorchOffReason];
+    if (TOOLShouldIntercept() && TOOLScreenIsNotFullyOnViaBacklightController()) {
+        TOOLLog("命中拦截判据且屏幕未全亮：第 3 层降级 performSinglePressAction");
+        /* I3：本层本来就无条件 %orig，关灯失败只是少关一次灯，不存在"抑制亮屏 /
+           置 inhibit"的半拦截状态；仍走同一入口以复用异常守卫。 */
+        TOOLTurnOffTorch();
     }
     %orig;   // 必须调：亮屏早在按下瞬间已发生，这里拦不住
 }
@@ -265,13 +423,14 @@ static inline BOOL TOOLClassResponds(Class cls, SEL sel)
     return cls && [cls instancesRespondToSelector:sel];
 }
 
-/* TOOLInstallHooks（Design Doc §4 逐字符照抄）：三层互斥降级装填。
+/* TOOLInstallHooks（Design Doc §4，第 2 层条件按 I1 加固，其余逐字符照抄）：
+   三层互斥降级装填。
    互斥只发生在层与层之间——装上前两层任意一组即记录层号并 return，不再往下看；
    第 1、2 层内部对父类与子类是并行覆盖关系，两个 if 之间既无 else 也无 return，
    两个都装（原因见段 ④ 注释与 Design Doc §3.0：子类覆盖了同名方法，只 hook 父类
    会在设备实例化子类时静默漏掉）。
    三层全不满足 ⇒ 什么都不装，只记层号 0（静默失效，不留半吊子 hook）。 */
-static void TOOLInstallHooks(void)
+static BOOL TOOLInstallHooks(void)
 {
     BOOL installedWake = NO;
 
@@ -286,40 +445,77 @@ static void TOOLInstallHooks(void)
         %init(TorchOffPerformWakeDoubleClick);
         installedWake = YES;
     }
-    if (installedWake) { TOOLLogInstalled(1); return; }
+    if (installedWake) { TOOLBOTH("installed at layer 1"); return YES; }
 
-    /* 第 2 层：consumeInitialPressDown —— 同样覆盖两个类 */
+    /* 第 2 层：consumeInitialPressDown —— 同样覆盖两个类。
+       置 YES 的前提从"consumeInitialPressDown 存在"加固为"consumeInitialPressDown
+       与 backlightController 都存在"（I1，父类与子类各自判断）：本层的屏幕判定链
+       第一环就是 [interaction backlightController]，缺它则 TOOLScreenIsNotFullyOn()
+       第一级就返回 NO ⇒ 这一层退化成纯 %orig 透传，却仍把 installedDown 置 YES，
+       第 3 层永不被装填 ⇒ 插件整体静默失效，而符号门禁可能一路全绿。
+       两个符号都问过再装，缺失时继续往下落到第 3 层。 */
     BOOL installedDown = NO;
     if (TOOLClassResponds(%c(SBSleepWakeHardwareButtonInteraction),
-                          @selector(consumeInitialPressDown))) {
+                          @selector(consumeInitialPressDown))
+        && TOOLClassResponds(%c(SBSleepWakeHardwareButtonInteraction),
+                             @selector(backlightController))) {
         %init(TorchOffConsumeInitialPressDown);
         installedDown = YES;
     }
     if (TOOLClassResponds(%c(SBDoubleClickSleepWakeHardwareButtonInteraction),
-                          @selector(consumeInitialPressDown))) {
+                          @selector(consumeInitialPressDown))
+        && TOOLClassResponds(%c(SBDoubleClickSleepWakeHardwareButtonInteraction),
+                             @selector(backlightController))) {
         %init(TorchOffConsumeInitialPressDownDoubleClick);
         installedDown = YES;
     }
-    if (installedDown) { TOOLLogInstalled(2); return; }
+    if (installedDown) { TOOLBOTH("installed at layer 2"); return YES; }
 
     /* 第 3 层：performSinglePressAction */
     if (TOOLClassResponds(%c(SBLockHardwareButtonActions),
                           @selector(performSinglePressAction))) {
         %init(TorchOffSinglePress);
-        TOOLLogInstalled(3);
+        TOOLBOTH("installed at layer 3");
+        return YES;
+    }
+
+    TOOLBOTH("installed at layer 0 (no class responded)");   // 三层全无 ⇒ 静默失效
+    return NO;
+}
+
+/* 唯一的构造函数。
+
+   【2026-09-22 修正 — 真机"零日志、零效果"的直接原因】
+
+   原实现把整个初始化押在一次 dispatch_async 上。反编译确认过生成的构造函数只有
+   5 条指令：取 __dispatch_main_q、取全局 block、尾调用 _dispatch_async——除此之
+   外什么都不做。也就是说，只要那次投递没能真正执行（构造期 libdispatch 尚未就绪、
+   或加载器在非常规线程/时机注入），就没有 %init、没有日志、没有任何效果，而现场
+   现象正是"零日志、零效果"。
+
+   改为：**先在构造函数里当场装填**，只有当场一个类都没响应时才回退到主队列重试。
+   这样：
+   - 注入进已运行的 SpringBoard（TweakInject 的做法）时，类必然已注册 ⇒ 立即装填成功，
+     完全不再依赖 dispatch_async；
+   - 真遇到 dyld 构造期类未注册，回退分支仍然覆盖。
+   两条路都写文件日志，一次就能分清是"没加载/ctor 没跑"还是"装填失败"。
+
+   文件日志在构造函数最前面写，它是"ctor 到底有没有被执行"的唯一硬证据。 */
+%ctor
+{
+    TOOLInitLogPath();
+    TOOLBOTH("=== ctor ran (pid %d) ===", (int)getpid());
+
+    if (TOOLInstallHooks()) {
+        TOOLBOTH("install succeeded inside ctor");
         return;
     }
 
-    TOOLLogInstalled(0);   // 三层全无 ⇒ 静默失效
-}
-
-/* 唯一的构造函数。装填延迟到主队列首轮（Design Doc §4.1）：本 dylib 未声明对
-   SpringBoard.framework 的链接依赖，dyld 可能先跑我们的 __mod_init_func，此时
-   SBSleepWakeHardwareButtonInteraction 尚未注册，%c() 返回 nil、%init 静默失败 ⇒
-   插件无声失效。主队列首轮执行必然早于任何 HID 事件被处理，仍满足 delta spec 的
-   「降级判断 MUST 在首次按压之前完成」。
-   代价是 %ctor 与 hook 生效之间有极小窗口，期间侧键走原生逻辑，可接受。 */
-%ctor
-{
-    dispatch_async(dispatch_get_main_queue(), ^{ TOOLInstallHooks(); });
+    TOOLBOTH("immediate install found nothing; deferring to main queue");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (TOOLInstallHooks())
+            TOOLBOTH("install succeeded on main queue");
+        else
+            TOOLBOTH("install failed on main queue too");
+    });
 }
